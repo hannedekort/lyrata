@@ -1,0 +1,79 @@
+#### PERFORM OUTLIER DETECTION
+library(pcadapt)
+library(qvalue)
+dataset = read.pcadapt("E:\\papers\\Arabidopsis TE\\lyrata\\Europe\\Europe.vcf", type="vcf", type.out="matrix") ## replace "Europe.vcf" by "America.vcf" for outlier detection across American populations
+poplist = read.table("E:\\papers\\Arabidopsis TE\\lyrata\\Europe\\info_Eur.txt", header = T) ## replace "info_Eur" by "info_Am" for outlier detection across American populations
+clusters_thinned <- pcadapt(dataset, K = 19, LD.clumping = list(size = 200, thr = 0.25), min.maf = 0) ### thin SNPs to remove LD (some PCs may be shaped by highly clustered SNPs)
+plot(clusters_thinned, option = "screeplot")
+scan <- pcadapt(dataset, K = 4, LD.clumping = list(size = 200, thr = 0.25), min.maf = 0) ### thin SNPs to remove LD (some PCs may be shaped by highly clustered SNPs)
+poplist.names = poplist$Cluster
+plot(scan, option="scores", pop = poplist.names, i = 1, j = 2) ## pca plot
+summary(scan)
+plot(scan, option="manhattan")  # manhattan plot
+pvalues = as.data.frame(scan$pvalues) ## for making manhattan plot (-log10(p))
+qval <- qvalue(scan$pvalues)$qvalues
+qvalues = as.data.frame(qval)
+
+### TRANSFORM VCF FILES INTO BAYESCAN FILES (COMPATIBLE WITH BAYESCAN PROGRAM FOR IDENTIFYING SIGNATURES OF BALANCING SELECTION)
+library(pegas) #to convert allelic dataset (from vcf) into genind
+library(graph4lg) ## to transform genind into genepop
+library(hierfstat) ## to transform genind to bayescan
+dataset=read.vcfR("E:\\papers\\Arabidopsis TE\\lyrata\\Europe\\Europe.vcf")
+mat = t(as.data.frame(extract.gt(dataset, "GT", as.numeric = TRUE, IDtoRowNames = TRUE))) ## 20 min voor 2.8 Gb (330k SNPs)
+write.table(mat, file = "E:\\papers\\Arabidopsis TE\\lyrata\\Europe\\Alleles_America.txt", row.names = TRUE, col.names = TRUE, sep = "\t") ## also remove "CHROM_POS" from the text file
+loci = read.loci("E:\\papers\\Arabidopsis TE\\lyrata\\America\\Alleles_America.txt", header=TRUE, loci.sep = "\t", allele.sep = "/|", col.pop = NULL, row.names=1)
+data_genind = loci2genind(loci, ploidy = 2, na.alleles = "NA", unphase = TRUE) ## takes about 1 minute for 10k loci, 5 mins for 20k loci
+poplist = read.table("E:\\papers\\Arabidopsis TE\\lyrata\\America\\info_TC.txt", header = T)
+data_genind@pop = as.factor(poplist$Cluster)
+data_genind@pop 
+data_genepop = genind_to_genepop(data_genind, output = "data.frame")
+data_fstat = genind2hierfstat(data_genind,pop=data_genind@pop) # pop = NULL will take the pop slot of the genind object
+write.bayescan(data_fstat, fn="E:\\papers\\Arabidopsis TE\\lyrata\\Europe\\Bayescan.bsc")
+
+### CALCULATE INBREEDING COEFFICIENTS
+library(hierfstat)
+fstat = read.fstat("E:\\papers\\Arabidopsis TE\\lyrata\\America\\FSTAT_Am.txt")  ## replace "FSTAT_Am" by "FSTAT_Eur" for FIS across European samples
+fstat[1:5,1:5]
+data = fstat2dos(fstat,diploid=TRUE)
+inbr = beta.dosage(data,inb=TRUE,Mb=FALSE)
+
+### MODELING HETEROZYGOSITY
+library("lme4")
+library("reshape2")
+library("glmmTMB")
+HOMHET = read.table("E:\\papers\\Arabidopsis TE\\lyrata\\America\\HOMHET_Am.txt", header = T) ## replace "HOMHET_Am" by "HOMHET_Eur" for the heterozygosity and transposon dataset across the Eureopan samples
+samples = read.table("E:\\papers\\Arabidopsis TE\\lyrata\\America\\info_Am.txt", header = T) ## replace "info_Am" by "info_Eur" for info on European samples
+head(HOMHET)
+head(samples)
+table <- melt(HOMHET, value.name = "H", variable.name ="Sample", id.vars=c("SNP","Outlier","Sense","Family","Superfamily","Superfamily2","SuperfamilyEffect","SqrtDist","Sense2","Sense_Gene","Hprop_O","Hprop_S","TE_Effect","TE_Effect2"))
+dataset = merge(table, samples) ## should count 184674 rows
+dataset = subset(dataset, Superfamily != "TE_NA")
+subset = subset(dataset, Fis < 0.6)  ## for models on subsets depending on inbreeding thresholds; use -0.3 as threshold in European dataset
+HE_TE = subset(dataset, TE_Effect == "CopiaHarbinger")
+HE_background = subset(dataset, TE_Effect != "CopiaHarbinger")
+
+Model0 = glmmTMB(as.factor(H) ~ Superfamily + Sense + Superfamily:Sense + (1 |Cluster), data = subset, family = binomial(link="cloglog")) ## using SNP or sample as random factors gives singular fit and convergence problem due to their overlap with SqrtDist and Fis, respectively
+Model0_anova = glmer(as.factor(H) ~ Superfamily + Sense + Superfamily:Sense + (1 |Cluster), data = subset, family = binomial(link="cloglog")) ## using SNP or sample as random factors gives singular fit and convergence problem due to their overlap with SqrtDist and Fis, respectively
+Model1 = glmmTMB(as.factor(H) ~ Sense + TE_Effect + poly(SqrtDist, 2) + poly(SqrtDist, 2):TE_Effect + poly(SqrtDist, 2):Sense + TE_Effect:Sense + (1 |Cluster), data = dataset, family = binomial(link="cloglog")) ## using SNP or sample as random factors gives singular fit and convergence problem due to their overlap with SqrtDist and Fis, respectively
+Model1_anova = glmer(as.factor(H) ~ Sense + TE_Effect + poly(SqrtDist, 2) + poly(SqrtDist, 2):TE_Effect + poly(SqrtDist, 2):Sense + TE_Effect:Sense + (1 |Cluster), data = dataset, family = binomial(link="cloglog")) ## using SNP or sample as random factors gives singular fit and convergence problem due to their overlap with SqrtDist and Fis, respectively
+Model2a = glmmTMB(as.factor(H) ~ Fis + Sense + Outlier + Fis:Outlier + Outlier:Sense + (1 |Cluster), data = HE_TE, family = binomial(link="cloglog")) ## using SNPs upstream of TEs as background/reference SNPs
+Model2a_anova = glmer(as.factor(H) ~ Fis + Sense + Outlier + Fis:Outlier + Outlier:Sense + (1 |Cluster), data = HE_TE, family = binomial(link="cloglog")) ## using SNPs upstream of TEs as background/reference SNPs
+Model2b = glmmTMB(as.factor(H) ~ Fis + Sense + Outlier + Fis:Outlier + Outlier:Sense + (1 |Cluster), data = HE_background, family = binomial(link="cloglog")) ## using SNPs upstream of TEs as background/reference SNPs
+Model2b_anova = glmer(as.factor(H) ~ Fis + Sense + Outlier + Fis:Outlier + Outlier:Sense + (1 |Cluster), data = HE_background, family = binomial(link="cloglog")) ## using SNPs upstream of TEs as background/reference SNPs
+Model3 = glmmTMB(as.factor(H) ~ TE_Effect + Sense + (1 |Cluster), data = dataset, family = binomial(link="cloglog"))
+Model3_anova = glmer(as.factor(H) ~ TE_Effect + Sense + (1 |Cluster), data = dataset, family = binomial(link="cloglog"))
+
+### GO ENRICHMENT
+library(topGO)
+Genes = read.table("E:\\papers\\Arabidopsis TE\\lyrata\\America\\GO analysis\\scores.txt", header = T)  ## use Table S1 for testing enrichment on other gene lists
+GOs <- readMappings(file = "E:/papers/Arabidopsis TE/lyrata/America/GO analysis/GOs.txt")
+GeneNames= Genes[, -c(1)]
+names(GeneNames)=Genes$Gene
+GeneSel <- function(allScore) {return(allScore > 0.5)} ## define test gene set: score 1 for the genes of interest (e.g. genes of drought-induced DMCs)
+x <- GeneSel(GeneNames)
+sum(x) ### the number of selected genes
+BPGOdata <- new("topGOdata",description = "Simple session", ontology = "BP", allGenes = GeneNames, geneSel = GeneSel, annot = annFUN.gene2GO, gene2GO = GOs)
+resultFis <- runTest(BPGOdata, algorithm = "classic", statistic = "fisher")
+allRes <- GenTable(BPGOdata, classic = resultFis,orderBy = "weight", ranksOf = "classic", topNodes = 100)
+output = as.data.frame(allRes)
+allGO = as.matrix(genesInTerm(BPGOdata)) ## to extract the genes linked to each go term
